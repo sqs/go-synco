@@ -23,7 +23,7 @@ type IMAPAccount struct {
 }
 
 type UIDFetchJob struct {
-	LoUID, HiUID uint32
+	uids []uint32
 }
 
 var	mbox string = "[Gmail]/All Mail"
@@ -34,68 +34,36 @@ func PrintMail(acct *IMAPAccount, query string) {
 
 	log.Printf("Running for user '%s' on IMAP server '%s:%d'", acct.Username, acct.Server.Host, acct.Server.Port)
 
-	conns := 1
-	partsize := 250
+	jobsize := 250
 
 	// Fetch UIDs.
 	c := Dial(acct.Server)
 	login(c, acct.Username, acct.Password)
 	c.Select(mbox, true)
 	uids, _ := SearchUIDs(c, query)
-	c.Close(false)
-	c.Logout(-1)
 
 	timestarted := time.Now()
 
-	// Fetch message MIME bodies.
-	nparts := (len(uids) + partsize - 1) / partsize
-	jobs := make([]UIDFetchJob, nparts)
+	nparts := (len(uids) + jobsize - 1) / jobsize
+	jobs := make([]*imap.SeqSet, nparts)
 	for i := 0; i < nparts; i++ {
-		lo := i * partsize
-		hi_exclusive := (i + 1) * partsize
+		lo := i * jobsize
+		hi_exclusive := (i + 1) * jobsize
 		if hi_exclusive >= len(uids) {
 			hi_exclusive = len(uids) - 1
 			for uids[hi_exclusive] == 0 { // hacky
 				hi_exclusive--
 			}
 		}
-		loUID := uids[lo]
-		hiUID := uids[hi_exclusive]
-		job := UIDFetchJob{ loUID, hiUID }
-		jobs[i] = job
+		set, _ := imap.NewSeqSet("")
+		set.AddNum(uids[lo:hi_exclusive]...)
+		jobs[i] = set
 	}
 
-	log.Printf("%d UIDs total, %d jobs of size <= %d\n", len(uids), len(jobs), partsize)
+	log.Printf("%d UIDs total, %d jobs of size <= %d\n", len(uids), len(jobs), jobsize)
 
-	// open conns
-	if conns > len(jobs) {
-		conns = len(jobs)
-	}
-	jobchan := make(chan UIDFetchJob)
-	for i := 0; i < conns; i++ {
-		go StartWorker(i, acct, jobchan)
-	}
-
-	nextjobindex := 0
-	quits := 0
-	for {
-		if quits == conns {
-			// have sent quits to everyone
-			break
-		}
-
-		wantjob := <-jobchan
-		if wantjob.LoUID == 0 {
-			if nextjobindex < len(jobs) {
-				jobchan <- jobs[nextjobindex]
-				nextjobindex++
-			} else {
-				jobchan <- UIDFetchJob{ 0, 0 }
-				quits++
-			}
-		} else {
-			panic("unknown wantjob value")
-		}
+	for _, jobUIDs := range jobs {
+		FetchMessages(c, jobUIDs)
 	}
 
 	timeelapsed := time.Since(timestarted)
@@ -103,6 +71,8 @@ func PrintMail(acct *IMAPAccount, query string) {
 	messagespersec := float64(len(uids)) / timeelapsed.Seconds()
 	log.Printf("Finished fetching %d messages in %.2fs (%.1fms per message; %.1f messages per second)\n", len(uids), timeelapsed.Seconds(), msecpermessage, messagespersec)
 
+	c.Close(false)
+	c.Logout(-1)
 }
 
 func SearchUIDs(c *imap.Client, query string) (uids []uint32, err error) {
@@ -140,26 +110,9 @@ func FetchAllUIDs(c *imap.Client) (uids []uint32, err error) {
 	return
 }
 
-func StartWorker(workerid int, acct *IMAPAccount, jobchan chan UIDFetchJob) {
-	c := Dial(acct.Server)
-	login(c, acct.Username, acct.Password)
-	c.Select(mbox, true)
 
-	for {
-		jobchan <- UIDFetchJob{ 0, 0 }
-		job := <-jobchan
-		if job.LoUID != 0 {
-			FetchMessages(c, job.LoUID, job.HiUID)
-			log.Printf("Worker %d finished one job\n", workerid)
-		} else {
-			break
-		}
-	}
-}
-
-func FetchMessages(c *imap.Client, loUID, hiUID uint32) (err error) {
-	set, _ := imap.NewSeqSet(fmt.Sprintf("%d:%d", loUID, hiUID))
-	cmd, err := c.UIDFetch(set, "RFC822")
+func FetchMessages(c *imap.Client, uidSet *imap.SeqSet) (err error) {
+	cmd, err := c.UIDFetch(uidSet, "RFC822")
 
 	for cmd.InProgress() {
 		c.Recv(-1)
